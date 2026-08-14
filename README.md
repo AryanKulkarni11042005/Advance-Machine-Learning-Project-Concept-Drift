@@ -127,4 +127,6 @@ Full methodology detail is in `paper/methodology.tex` (or `docs/methodology.md`,
 If this work informs your research, citation details will be added on paper acceptance.
 
 ## License
-This project is licensed under the MIT License — see LICENSE.md for details.
+[![License: MIT](https://shields.io)](LICENSE.md)
+
+This project is licensed under the MIT License - see the [LICENSE.md](LICENSE.md) file for details.
