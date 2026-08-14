@@ -127,5 +127,4 @@ Full methodology detail is in `paper/methodology.tex` (or `docs/methodology.md`,
 If this work informs your research, citation details will be added on paper acceptance.
 
 ## License
-
-TBD — add a license (e.g., MIT) before making the repository public.
+This project is licensed under the MIT License — see LICENSE.md for details.
