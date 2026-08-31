@@ -1,1 +1,13 @@
 .vscode
+__pycache__/
+*.pyc
+
+# Data is fetched locally, never committed
+data/
+
+# Experiment outputs
+results/
+mlruns/
+mlflow.db
+
+.ipynb_checkpoints/
