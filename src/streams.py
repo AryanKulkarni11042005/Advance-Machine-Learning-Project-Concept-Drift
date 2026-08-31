@@ -150,3 +150,58 @@ STREAMS = {
     "elec2": elec2,
     "airlines": airlines,
 }
+
+
+def stock_sp500(csv="stock_market_cleaned.csv", seed=None, scale_free=True):
+    """S&P 500 daily direction, 2005-2024. Fixed rows in temporal order.
+
+    Real-world stream with no ground-truth drift index, so drift_points is
+    empty and recovery time is not reported. `seed` is accepted and ignored.
+
+    scale_free=True replaces raw price levels (ma_5/20/50, macd) with ratios
+    to the current close. Raw levels drift ~4.8x across this period, so a tree
+    splitting on `ma_50 < 1200` learns a rule that stops firing after ~2013.
+    That is price inflation masquerading as concept drift, and it contaminates
+    the very thing this benchmark measures.
+
+    NOTE ON LABELS: the target is next-day direction, so the label for row t is
+    only known after t+1 closes. Feeding it to learn_one at time t trains the
+    model on the future. Use `delay=1` in run_strategy to hold each sample back
+    one step - see the delayed-label handling there.
+    """
+    import numpy as np
+    import pandas as pd
+
+    path = pathlib.Path(csv)
+    if not path.is_absolute():
+        for cand in (DATA_DIR / csv, DATA_DIR.parent / "notebooks" / csv, path):
+            if cand.exists():
+                path = cand
+                break
+    if not path.exists():
+        raise FileNotFoundError(f"{csv} not found - build it in the stock notebook first.")
+
+    df = pd.read_csv(path)
+    df = df.replace([np.inf, -np.inf], np.nan)
+
+    if scale_free and "ma_50" in df.columns:
+        close_proxy = df["ma_5"] * (1 + df["return_1d"])  # close is not stored
+        df["ma_5_ratio"] = close_proxy / df["ma_5"] - 1
+        df["ma_20_ratio"] = df["ma_5"] / df["ma_20"] - 1
+        df["ma_50_ratio"] = df["ma_20"] / df["ma_50"] - 1
+        df["macd_norm"] = df["macd"] / df["ma_20"]
+        df["macd_sig_norm"] = df["macd_signal"] / df["ma_20"]
+        feats = ["return_1d", "volatility_10d", "volume_change", "rsi_14",
+                 "ma_5_ratio", "ma_20_ratio", "ma_50_ratio",
+                 "macd_norm", "macd_sig_norm"]
+    else:
+        feats = [c for c in df.columns if c not in ("target", "Date")]
+
+    df = df.dropna(subset=feats + ["target"]).reset_index(drop=True)
+    samples = [({f: float(r[f]) for f in feats}, int(r["target"]))
+               for _, r in df.iterrows()]
+    return samples, []
+
+
+DETERMINISTIC.add("stock_sp500")
+STREAMS["stock_sp500"] = stock_sp500

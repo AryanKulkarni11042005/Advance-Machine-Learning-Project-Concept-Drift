@@ -2,6 +2,7 @@
 """Grid runner: datasets x strategies x seeds, all logged to MLflow."""
 import statistics
 import sys
+from collections import Counter
 
 import pandas as pd
 
@@ -14,6 +15,21 @@ SEEDS = (42, 43, 44)
 # dataset every other strategy is fully deterministic, so repeating it across
 # seeds yields byte-identical runs.
 STOCHASTIC_STRATEGIES = {"arf"}
+
+# Streams whose label is not knowable at prediction time. stock_sp500's target
+# is next-day direction, so learning it at t would train on the future; delay=1
+# holds each sample until its label would genuinely have arrived.
+STREAM_DELAY = {"stock_sp500": 1}
+
+# Minimum lift over the majority class for a result to count as having learned
+# anything. One percentage point; below this the "win" is noise.
+MIN_LIFT = 0.01
+
+
+def majority_rate(samples):
+    """Accuracy of always predicting the most common label."""
+    counts = Counter(y for _, y in samples)
+    return max(counts.values()) / sum(counts.values())
 
 
 def _seeds_for(ds_name, strat, seeds):
@@ -56,7 +72,8 @@ def run_grid(datasets=None, strategies=None, seeds=SEEDS, log_to_mlflow=True,
                 samples, drift = (cache if cache is not None
                                   else streams.STREAMS[ds_name](seed=seed))
                 r = run_strategy(samples, strat, ds_name, drift, seed=seed,
-                                 log_to_mlflow=log_to_mlflow)
+                                 log_to_mlflow=log_to_mlflow,
+                                 delay=STREAM_DELAY.get(ds_name, 0))
                 measured = [x for x in r["recoveries"] if x is not None]
                 rows.append({
                     "dataset": ds_name,
@@ -71,6 +88,11 @@ def run_grid(datasets=None, strategies=None, seeds=SEEDS, log_to_mlflow=True,
                                       if measured else None),
                     "n_drifts": len(drift),
                     "n_recovered": len(measured),
+                    # Always-predict-the-majority-class rate. A strategy that
+                    # does not clear this has learned only the class prior;
+                    # on near-unpredictable streams every strategy lands here,
+                    # and a ranking among them is a ranking of noise.
+                    "majority_baseline": majority_rate(samples),
                 })
                 if verbose:
                     print(f"{ds_name:14s} {strat:22s} seed={seed} "
@@ -96,7 +118,11 @@ def summarise(df):
         n_recovered=("n_recovered", "sum"),
         n_drifts=("n_drifts", "sum"),
         n_runs=("seed", "count"),
+        majority_baseline=("majority_baseline", "first"),
     ).reset_index()
+    # Negative means the strategy is worse than always guessing the majority
+    # class - it has learned the prior and nothing more.
+    agg["lift_over_majority"] = agg["acc_mean"] - agg["majority_baseline"]
     return agg.sort_values(["dataset", "acc_mean"], ascending=[True, False])
 
 
@@ -124,6 +150,14 @@ def best_per_dataset(agg):
             std = top["acc_std"]
             row["separable"] = (None if pd.isna(std)
                                 else bool(margin > std))
+        # A winner that does not clear the majority class has learned the prior
+        # and nothing more; the ranking above it is noise. The threshold is not
+        # zero: a lift of +0.0008 is arithmetically positive and practically
+        # indistinguishable from guessing, so require at least MIN_LIFT.
+        lift = top.get("lift_over_majority")
+        if lift is not None and not pd.isna(lift):
+            row["lift_over_majority"] = lift
+            row["beats_majority"] = bool(lift > MIN_LIFT)
         out.append(row)
     return pd.DataFrame(out)
 
