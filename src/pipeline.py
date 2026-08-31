@@ -2,7 +2,7 @@
 """Prequential (test-then-train) evaluation of drift adaptation strategies."""
 import pathlib
 import tracemalloc
-from collections import deque
+from collections import Counter, deque
 from time import perf_counter
 
 import mlflow
@@ -64,8 +64,17 @@ def recovery_time(curve, drift_idx, tolerance=0.02):
 
 
 def run_strategy(samples, strategy_name, dataset_name, drift_points=(),
-                 seed=42, window=500, eval_every=200, log_to_mlflow=True):
+                 seed=42, window=500, eval_every=200, log_to_mlflow=True,
+                 delay=0):
     """Run one (dataset, strategy, seed) configuration prequentially.
+
+    delay: how many steps to hold a sample before learning from it. Use this
+    when the label is not knowable at prediction time - a forecast of the next
+    period's outcome, for instance, whose true value only arrives later.
+    delay=0 (the default) is standard prequential: predict, then immediately
+    learn. delay=1 predicts at t but learns (x_t, y_t) only at t+1, which is
+    what a next-step forecast actually permits. Learning a forward-looking
+    label at t trains the model on the future and inflates accuracy.
 
     Returns a dict of results; also logs params and metrics to MLflow.
     """
@@ -83,9 +92,16 @@ def run_strategy(samples, strategy_name, dataset_name, drift_points=(),
     f1 = metrics.MacroF1()
     buffer = deque(maxlen=window)
 
+    # Always-predict-majority rate: the floor any strategy must clear to have
+    # learned anything. Logged with every run so a near-chance result cannot be
+    # mistaken for a real one.
+    _labels = Counter(y for _, y in samples)
+    majority_baseline = max(_labels.values()) / sum(_labels.values())
+
     detected_drifts = []
     curve = []          # (index, windowed accuracy) - windowed, so a local
     win_correct = win_n = 0   # dip at the drift is visible instead of averaged away
+    pending = deque()   # samples awaiting their label under `delay`
 
     tracemalloc.start()
     start = perf_counter()
@@ -117,8 +133,18 @@ def run_strategy(samples, strategy_name, dataset_name, drift_points=(),
                 for bx, by in buffer:
                     model.learn_one(bx, by)
 
-        model.learn_one(x, y)
-        buffer.append((x, y))
+        # Under delay>0 the pair (x, y) is not learnable yet: at time i its
+        # label still lies in the future. Hold it and learn it once it would
+        # genuinely be known.
+        if delay:
+            pending.append((x, y))
+            if len(pending) > delay:
+                lx, ly = pending.popleft()
+                model.learn_one(lx, ly)
+                buffer.append((lx, ly))
+        else:
+            model.learn_one(x, y)
+            buffer.append((x, y))
 
         if win_n and (i + 1) % eval_every == 0:
             curve.append((i + 1, win_correct / win_n))
@@ -141,6 +167,8 @@ def run_strategy(samples, strategy_name, dataset_name, drift_points=(),
         "peak_memory_mb": peak / 1e6,
         "n_drift_detections": len(detected_drifts),
         "detected_drifts": detected_drifts,
+        "majority_baseline": majority_baseline,
+        "lift_over_majority": acc.get() - majority_baseline,
         "recoveries": recoveries,
         "curve": curve,
     }
@@ -158,6 +186,7 @@ def run_strategy(samples, strategy_name, dataset_name, drift_points=(),
                 "retrain_every": retrain_every,
                 "detector": "ADWIN" if detector is not None else None,
                 "n_samples": len(samples),
+                "delay": delay,
                 "true_drift_points": list(drift_points),
             })
             for idx, a in curve:
@@ -168,6 +197,8 @@ def run_strategy(samples, strategy_name, dataset_name, drift_points=(),
                 "runtime_sec": results["runtime_sec"],
                 "peak_memory_mb": results["peak_memory_mb"],
                 "n_drift_detections": results["n_drift_detections"],
+                "majority_baseline": majority_baseline,
+                "lift_over_majority": results["lift_over_majority"],
             })
             # Logged only when measurable: absent on gradual/real-world streams
             # with no ground-truth drift index, and when a strategy never

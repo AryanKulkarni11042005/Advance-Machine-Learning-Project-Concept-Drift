@@ -1,8 +1,13 @@
 # Findings
 
 Working notes for the paper's results section. Numbers come from
-`results/summary.csv`; every run is in MLflow
-(`mlflow ui --backend-store-uri sqlite:///mlflow.db`).
+`results/summary.csv` (59 runs: 5 streams x 5 strategies x seeds).
+
+**The MLflow store holds only the most recent run.** A branch checkout restored
+an older tracked `mlflow.db` over the populated one, discarding the per-step
+`windowed_accuracy` curves. Every final metric survives in
+`results/raw_runs.csv`, which is what these notes are based on. Re-run
+`src/experiments.py` if the over-time curves are needed for figures.
 
 ## The headline result is not "ARF wins"
 
@@ -15,7 +20,7 @@ adaptation stops helping and starts hurting**.
 | `sea_gradual` | Gradual, injected | ARF | 0.9348 | Yes — clearly |
 | `hyperplane` | Continuous rotation | detector_full_retrain — **not separable** (margin 0.0006 < std 0.0077) | 0.8839 | No |
 | `elec2` | Recurring, real | ARF | 0.7983 | Yes — ARF by ~7.6 pts |
-| `airlines` | Implicit, real | ARF 0.654 (+0.005 for 44x runtime) | 0.6488 | **No — retraining hurts** |
+| `airlines` | Implicit, real | ARF 0.6541 +/- 0.0012 (+0.005 for 46x runtime) | 0.6488 | **No — retraining hurts** |
 
 ## Three claims the data supports
 
@@ -44,7 +49,7 @@ ARF's runtime against the cheapest strategy on the same stream:
 |---|---|---|---|
 | `sea_abrupt` | ~22 s | ~1.4 s | ~15x |
 | `elec2` | ~127 s | ~6 s | ~21x |
-| `airlines` | ~656 s | ~14 s | ~44x |
+| `airlines` | ~702 s | ~14 s | ~46x |
 
 On Airlines that buys +0.004 accuracy. Whether that trade is worth it is a
 budget question, and the answer is plainly no for most deployments.
