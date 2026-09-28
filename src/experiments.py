@@ -7,14 +7,14 @@ from collections import Counter
 import pandas as pd
 
 import streams
-from pipeline import STRATEGIES, run_strategy
+from pipeline import NEURAL_STRATEGIES, STRATEGIES, run_strategy
 
 SEEDS = (42, 43, 44)
 
 # Strategies whose only randomness is the model's own. On a fixed real-world
 # dataset every other strategy is fully deterministic, so repeating it across
 # seeds yields byte-identical runs.
-STOCHASTIC_STRATEGIES = {"arf", "lstm", "gru"}
+STOCHASTIC_STRATEGIES = {"arf", *NEURAL_STRATEGIES}
 
 # Streams whose label is not knowable at prediction time. stock_sp500's target
 # is next-day direction, so learning it at t would train on the future; delay=1
@@ -84,6 +84,7 @@ def run_grid(datasets=None, strategies=None, seeds=SEEDS, log_to_mlflow=True,
                     "runtime_sec": r["runtime_sec"],
                     "peak_memory_mb": r["peak_memory_mb"],
                     "n_drift_detections": r["n_drift_detections"],
+                    "n_valid_predictions": r["n_valid_predictions"],
                     "mean_recovery": (statistics.mean(measured)
                                       if measured else None),
                     "n_drifts": len(drift),

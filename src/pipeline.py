@@ -50,8 +50,18 @@ STRATEGIES = {
 # strategies are opt-in until categorical preprocessing and adaptation policy
 # are designed in a later phase.
 NEURAL_STRATEGIES = {
-    "lstm": dict(architecture="lstm"),
-    "gru": dict(architecture="gru"),
+    "lstm": dict(architecture="lstm", adaptation="online"),
+    "gru": dict(architecture="gru", adaptation="online"),
+    "lstm_adwin_reset": dict(architecture="lstm", adaptation="adwin_reset",
+                              detector=True),
+    "gru_adwin_reset": dict(architecture="gru", adaptation="adwin_reset",
+                             detector=True),
+    "lstm_adwin_finetune": dict(architecture="lstm",
+                                 adaptation="adwin_finetune", detector=True,
+                                 replay_buffer_size=32),
+    "gru_adwin_finetune": dict(architecture="gru",
+                                adaptation="adwin_finetune", detector=True,
+                                replay_buffer_size=32),
 }
 
 
@@ -98,6 +108,7 @@ def run_strategy(samples, strategy_name, dataset_name, drift_points=(),
             architecture=neural_cfg["architecture"],
             input_size=len(feature_names), seed=seed, sequence_length=10,
         )
+        neural_buffer = deque(maxlen=neural_cfg.get("replay_buffer_size", 32))
         model_fn = None
         cfg = {}
     else:
@@ -107,7 +118,9 @@ def run_strategy(samples, strategy_name, dataset_name, drift_points=(),
             return _factory(seed=seed)
         model = model_fn()
         sequence_builder = None
-    detector = ADWIN() if cfg.get("detector") else None
+    detector_enabled = (neural_cfg.get("detector", False) if neural_cfg
+                        else cfg.get("detector", False))
+    detector = ADWIN() if detector_enabled else None
     reset_on_drift = cfg.get("reset_on_drift", False)
     refit_on_reset = cfg.get("refit_on_reset", False)
     retrain_every = cfg.get("retrain_every")
@@ -123,9 +136,23 @@ def run_strategy(samples, strategy_name, dataset_name, drift_points=(),
     majority_baseline = max(_labels.values()) / sum(_labels.values())
 
     detected_drifts = []
+    valid_predictions = 0
     curve = []          # (index, windowed accuracy) - windowed, so a local
     win_correct = win_n = 0   # dip at the drift is visible instead of averaged away
     pending = deque()   # samples awaiting their label under `delay`
+
+    def adapt_neural_from_error(error, detection_index):
+        if detector is None or error is None:
+            return
+        detector.update(error)
+        if detector.drift_detected:
+            detected_drifts.append(detection_index)
+            if neural_cfg["adaptation"] == "adwin_reset":
+                model.reset()
+            elif neural_cfg["adaptation"] == "adwin_finetune":
+                # Replay only labels already revealed before this detection.
+                for buffered_sequence, buffered_label in neural_buffer:
+                    model.update(buffered_sequence, buffered_label)
 
     tracemalloc.start()
     start = perf_counter()
@@ -139,6 +166,7 @@ def run_strategy(samples, strategy_name, dataset_name, drift_points=(),
             y_pred = model.predict_one(x)
 
         if y_pred is not None:
+            valid_predictions += 1
             acc.update(y, y_pred)
             f1.update(y, y_pred)
             win_correct += int(y_pred == y)
@@ -146,7 +174,7 @@ def run_strategy(samples, strategy_name, dataset_name, drift_points=(),
             # Feed the detector only on real predictions. Counting the warmup
             # (y_pred is None) as an error would inject a false error signal
             # and can trip the detector before any drift exists.
-            if detector is not None:
+            if detector is not None and not sequence_builder:
                 detector.update(int(y_pred != y))
                 if detector.drift_detected:
                     detected_drifts.append(i)
@@ -168,20 +196,31 @@ def run_strategy(samples, strategy_name, dataset_name, drift_points=(),
         if delay:
             if sequence_builder:
                 if sequence is not None:
-                    pending.append((sequence, y))
+                    # Score immediately as the existing prequential loop does,
+                    # but withhold detector feedback and training until label
+                    # arrival. This prevents delayed labels from leaking.
+                    pending.append((sequence, y,
+                                    int(y_pred != y) if y_pred is not None else None))
             else:
                 pending.append((x, y))
             if len(pending) > delay:
-                lx, ly = pending.popleft()
+                item = pending.popleft()
                 if sequence_builder:
+                    lx, ly, error = item
+                    adapt_neural_from_error(error, i)
                     model.update(lx, ly)
+                    neural_buffer.append((lx, ly))
                 else:
+                    lx, ly = item
                     model.learn_one(lx, ly)
                     buffer.append((lx, ly))
         else:
             if sequence_builder:
                 if sequence is not None:
+                    if detector is not None:
+                        adapt_neural_from_error(int(y_pred != y), i)
                     model.update(sequence, y)
+                    neural_buffer.append((sequence, y))
             else:
                 model.learn_one(x, y)
                 buffer.append((x, y))
@@ -206,6 +245,7 @@ def run_strategy(samples, strategy_name, dataset_name, drift_points=(),
         "runtime_sec": elapsed,
         "peak_memory_mb": peak / 1e6,
         "n_drift_detections": len(detected_drifts),
+        "n_valid_predictions": valid_predictions,
         "detected_drifts": detected_drifts,
         "majority_baseline": majority_baseline,
         "lift_over_majority": acc.get() - majority_baseline,
@@ -231,7 +271,16 @@ def run_strategy(samples, strategy_name, dataset_name, drift_points=(),
                 "true_drift_points": list(drift_points),
             })
             if sequence_builder:
-                mlflow.log_params({f"neural_{k}": v for k, v in model.metadata.items()})
+                mlflow.log_params({
+                    "model_family": model.metadata["model_type"],
+                    "sequence_length": model.metadata["sequence_length"],
+                    "hidden_size": model.metadata["hidden_size"],
+                    "adaptation_strategy": neural_cfg["adaptation"],
+                    "optimizer": model.metadata["optimizer"],
+                    "learning_rate": model.metadata["learning_rate"],
+                    "update_steps_per_label": model.metadata["updates_per_label"],
+                    "replay_buffer_size": neural_cfg.get("replay_buffer_size", 0),
+                })
             for idx, a in curve:
                 mlflow.log_metric("windowed_accuracy", a, step=idx)
             mlflow.log_metrics({
@@ -240,6 +289,7 @@ def run_strategy(samples, strategy_name, dataset_name, drift_points=(),
                 "runtime_sec": results["runtime_sec"],
                 "peak_memory_mb": results["peak_memory_mb"],
                 "n_drift_detections": results["n_drift_detections"],
+                "n_valid_predictions": results["n_valid_predictions"],
                 "majority_baseline": majority_baseline,
                 "lift_over_majority": results["lift_over_majority"],
             })
