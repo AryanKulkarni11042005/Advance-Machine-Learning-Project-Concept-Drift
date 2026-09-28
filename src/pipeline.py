@@ -8,6 +8,8 @@ from time import perf_counter
 import mlflow
 from river import forest, metrics, tree
 from river.drift import ADWIN
+from models.neural_adapter import NeuralAdapter
+from models.sequence import RollingSequence
 
 # Local SQLite backend: notebooks work whether or not a tracking server is up.
 # Browse with `mlflow ui --backend-store-uri sqlite:///mlflow.db`.
@@ -44,6 +46,14 @@ STRATEGIES = {
     "arf": dict(model_fn=lambda seed=None: forest.ARFClassifier(seed=seed)),
 }
 
+# Kept separate so the existing full benchmark grid remains unchanged. Neural
+# strategies are opt-in until categorical preprocessing and adaptation policy
+# are designed in a later phase.
+NEURAL_STRATEGIES = {
+    "lstm": dict(architecture="lstm"),
+    "gru": dict(architecture="gru"),
+}
+
 
 def recovery_time(curve, drift_idx, tolerance=0.02):
     """Samples from a drift until windowed accuracy returns to its pre-drift level.
@@ -78,16 +88,30 @@ def run_strategy(samples, strategy_name, dataset_name, drift_points=(),
 
     Returns a dict of results; also logs params and metrics to MLflow.
     """
-    cfg = STRATEGIES[strategy_name]
-    _factory = cfg.get("model_fn", base_learner)
-    def model_fn():
-        return _factory(seed=seed)
+    neural_cfg = NEURAL_STRATEGIES.get(strategy_name)
+    if neural_cfg:
+        first_features = samples[0][0]
+        feature_names = tuple(first_features.keys())
+        sequence_builder = RollingSequence(sequence_length=10,
+                                           feature_names=feature_names)
+        model = NeuralAdapter(
+            architecture=neural_cfg["architecture"],
+            input_size=len(feature_names), seed=seed, sequence_length=10,
+        )
+        model_fn = None
+        cfg = {}
+    else:
+        cfg = STRATEGIES[strategy_name]
+        _factory = cfg.get("model_fn", base_learner)
+        def model_fn():
+            return _factory(seed=seed)
+        model = model_fn()
+        sequence_builder = None
     detector = ADWIN() if cfg.get("detector") else None
     reset_on_drift = cfg.get("reset_on_drift", False)
     refit_on_reset = cfg.get("refit_on_reset", False)
     retrain_every = cfg.get("retrain_every")
 
-    model = model_fn()
     acc = metrics.Accuracy()
     f1 = metrics.MacroF1()
     buffer = deque(maxlen=window)
@@ -107,7 +131,12 @@ def run_strategy(samples, strategy_name, dataset_name, drift_points=(),
     start = perf_counter()
 
     for i, (x, y) in enumerate(samples):
-        y_pred = model.predict_one(x)
+        if sequence_builder:
+            sequence = sequence_builder.append(x)
+            y_pred = model.predict(sequence) if sequence is not None else None
+        else:
+            sequence = None
+            y_pred = model.predict_one(x)
 
         if y_pred is not None:
             acc.update(y, y_pred)
@@ -137,14 +166,25 @@ def run_strategy(samples, strategy_name, dataset_name, drift_points=(),
         # label still lies in the future. Hold it and learn it once it would
         # genuinely be known.
         if delay:
-            pending.append((x, y))
+            if sequence_builder:
+                if sequence is not None:
+                    pending.append((sequence, y))
+            else:
+                pending.append((x, y))
             if len(pending) > delay:
                 lx, ly = pending.popleft()
-                model.learn_one(lx, ly)
-                buffer.append((lx, ly))
+                if sequence_builder:
+                    model.update(lx, ly)
+                else:
+                    model.learn_one(lx, ly)
+                    buffer.append((lx, ly))
         else:
-            model.learn_one(x, y)
-            buffer.append((x, y))
+            if sequence_builder:
+                if sequence is not None:
+                    model.update(sequence, y)
+            else:
+                model.learn_one(x, y)
+                buffer.append((x, y))
 
         if win_n and (i + 1) % eval_every == 0:
             curve.append((i + 1, win_correct / win_n))
@@ -180,7 +220,8 @@ def run_strategy(samples, strategy_name, dataset_name, drift_points=(),
             mlflow.log_params({
                 "dataset": dataset_name,
                 "strategy": strategy_name,
-                "base_learner": model_fn().__class__.__name__,
+                "base_learner": (model.metadata["model_type"] if sequence_builder
+                                 else model_fn().__class__.__name__),
                 "seed": seed,
                 "window": window,
                 "retrain_every": retrain_every,
@@ -189,6 +230,8 @@ def run_strategy(samples, strategy_name, dataset_name, drift_points=(),
                 "delay": delay,
                 "true_drift_points": list(drift_points),
             })
+            if sequence_builder:
+                mlflow.log_params({f"neural_{k}": v for k, v in model.metadata.items()})
             for idx, a in curve:
                 mlflow.log_metric("windowed_accuracy", a, step=idx)
             mlflow.log_metrics({

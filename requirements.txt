@@ -143,6 +143,7 @@ rfc3339-validator==0.1.4
 rfc3986-validator==0.1.1
 rfc3987-syntax==1.1.0
 river==0.26.1
+torch==2.4.1
 rpds-py==2026.6.3
 scikit-learn==1.9.0
 scipy==1.17.1

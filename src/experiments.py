@@ -14,7 +14,7 @@ SEEDS = (42, 43, 44)
 # Strategies whose only randomness is the model's own. On a fixed real-world
 # dataset every other strategy is fully deterministic, so repeating it across
 # seeds yields byte-identical runs.
-STOCHASTIC_STRATEGIES = {"arf"}
+STOCHASTIC_STRATEGIES = {"arf", "lstm", "gru"}
 
 # Streams whose label is not knowable at prediction time. stock_sp500's target
 # is next-day direction, so learning it at t would train on the future; delay=1
@@ -163,11 +163,18 @@ def best_per_dataset(agg):
 
 
 if __name__ == "__main__":
+    import pathlib
+
+    pathlib.Path("results").mkdir(parents=True, exist_ok=True)
+
     df = run_grid()
     df.to_csv("results/raw_runs.csv", index=False)
+
     agg = summarise(df)
     agg.to_csv("results/summary.csv", index=False)
+
     print("\n=== summary ===")
     print(agg.to_string(index=False))
+
     print("\n=== best per dataset ===")
     print(best_per_dataset(agg).to_string(index=False))
