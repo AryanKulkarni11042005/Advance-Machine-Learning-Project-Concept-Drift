@@ -13,6 +13,7 @@ import importlib.metadata
 import json
 import os
 import pathlib
+import tempfile
 import platform
 import subprocess
 import sys
@@ -146,22 +147,84 @@ def _summary(raw):
     return pd.DataFrame(rows)
 
 
+EVENT_COLUMNS = ["run_id", "dataset", "strategy", "seed", "feedback_index",
+                 "prediction_index", "detected_at", "adwin_delta", "adwin_clock"]
+RECOVERY_COLUMNS = ["run_id", "dataset", "strategy", "seed", "drift_index",
+                    "baseline_accuracy", "threshold", "recovery_index",
+                    "recovery_time", "status"]
+
+
+def _atomic_csv(frame, path):
+    """Replace a checkpoint atomically so interruption keeps the prior file."""
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp",
+                                     dir=path.parent)
+    os.close(fd)
+    try:
+        frame.to_csv(temporary, index=False)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def _auxiliary_frames(raw):
+    events, recoveries = [], []
+    for row in raw.to_dict("records"):
+        key = {name: row[name] for name in ("run_id", "dataset", "strategy", "seed")}
+        for event in json.loads(row.get("drift_events_json") or "[]"):
+            events.append({**key, **event, "adwin_delta": row.get("adwin_delta"),
+                           "adwin_clock": row.get("adwin_clock")})
+        for recovery in json.loads(row.get("recovery_records_json") or "[]"):
+            recoveries.append({**key, **recovery})
+    return (pd.DataFrame(events, columns=EVENT_COLUMNS),
+            pd.DataFrame(recoveries, columns=RECOVERY_COLUMNS))
+
+
+def _checkpoint(output, raw):
+    _atomic_csv(raw, output / "raw_runs.csv")
+    _atomic_csv(_summary(raw), output / "summary.csv")
+    events, recoveries = _auxiliary_frames(raw)
+    _atomic_csv(events, output / "drift_events.csv")
+    _atomic_csv(recoveries, output / "recoveries.csv")
+
+
 def run(config_path=ROOT / "configs" / "phase3.yaml", smoke=False, pilot=False,
-        log_to_mlflow=True):
+        log_to_mlflow=True, resume=None):
     if smoke and pilot:
         raise ValueError("--smoke and --pilot are mutually exclusive")
-    cfg = _resolved_config(pathlib.Path(config_path), smoke=smoke, pilot=pilot)
+    if resume and (smoke or pilot):
+        raise ValueError("--resume cannot be combined with --smoke or --pilot")
+    if resume:
+        output = pathlib.Path(resume).expanduser().resolve()
+        config_file = output / "config.yaml"
+        if not output.is_dir() or not config_file.is_file():
+            raise ValueError(f"--resume requires an existing run directory with config.yaml: {output}")
+        with config_file.open(encoding="utf-8") as f:
+            cfg = yaml.safe_load(f)
+        _validate_config(cfg)
+    else:
+        cfg = _resolved_config(pathlib.Path(config_path), smoke=smoke, pilot=pilot)
     exp = cfg["experiment"]
-    output = (ROOT / exp["output_root"] / exp["run_id"]).resolve()
-    output.mkdir(parents=True, exist_ok=False)
-    with (output / "config.yaml").open("w", encoding="utf-8") as f:
-        yaml.safe_dump(cfg, f, sort_keys=False, allow_unicode=True)
+    if not resume:
+        output = (ROOT / exp["output_root"] / exp["run_id"]).resolve()
+        output.mkdir(parents=True, exist_ok=False)
+        with (output / "config.yaml").open("w", encoding="utf-8") as f:
+            yaml.safe_dump(cfg, f, sort_keys=False, allow_unicode=True)
 
-    raw_rows, event_rows, recovery_rows = [], [], []
+    raw_path = output / "raw_runs.csv"
+    raw = pd.read_csv(raw_path) if resume and raw_path.exists() else pd.DataFrame()
+    if not raw.empty:
+        raw = raw.drop_duplicates(subset=["dataset", "strategy", "seed"], keep="first")
+    raw_rows = raw.to_dict("records")
+    completed_keys = {(str(row["dataset"]), str(row["strategy"]), int(row["seed"]))
+                      for row in raw_rows}
     cache = {}
     total = sum(len(cfg["eligibility"][d]) * len(cfg["seeds"])
                 for d in cfg["datasets"])
-    completed = 0
+    completed = len(completed_keys)
+    if resume:
+        print(f"[RESUME] Existing completed runs: {completed}", flush=True)
+        print(f"[RESUME] Remaining runs: {total - completed}", flush=True)
     for dataset, dataset_cfg in cfg["datasets"].items():
         fixed = streams.is_deterministic(dataset)
         if fixed:
@@ -169,6 +232,9 @@ def run(config_path=ROOT / "configs" / "phase3.yaml", smoke=False, pilot=False,
                                                 **dataset_cfg["stream"])
         for strategy in cfg["eligibility"][dataset]:
             for seed in cfg["seeds"]:
+                key = (str(dataset), str(strategy), int(seed))
+                if key in completed_keys:
+                    continue
                 if fixed:
                     samples, drift_points = cache[dataset]
                 else:
@@ -220,16 +286,9 @@ def run(config_path=ROOT / "configs" / "phase3.yaml", smoke=False, pilot=False,
                     "n_known_drifts": len(drift_points),
                     "independence_unit": _independence_unit(dataset, strategy, seed),
                 })
-                for event in result["drift_events"]:
-                    event_rows.append({"run_id": exp["run_id"], "dataset": dataset,
-                                       "strategy": strategy, "seed": seed,
-                                       **event, "adwin_delta": cfg["adwin"]["delta"],
-                                       "adwin_clock": cfg["adwin"]["clock"]})
-                for recovery in result["recovery_records"]:
-                    recovery_rows.append({"run_id": exp["run_id"], "dataset": dataset,
-                                          "strategy": strategy, "seed": seed,
-                                          **recovery})
                 completed += 1
+                completed_keys.add(key)
+                _checkpoint(output, pd.DataFrame(raw_rows))
                 print(f"[{completed}/{total}] {dataset} {strategy} seed={seed} "
                       f"accuracy={result['final_accuracy']:.4f} "
                       f"valid={result['n_valid_predictions']} "
@@ -237,16 +296,7 @@ def run(config_path=ROOT / "configs" / "phase3.yaml", smoke=False, pilot=False,
 
     raw = pd.DataFrame(raw_rows)
     summary = _summary(raw)
-    raw.to_csv(output / "raw_runs.csv", index=False)
-    summary.to_csv(output / "summary.csv", index=False)
-    event_columns = ["run_id", "dataset", "strategy", "seed", "feedback_index",
-                     "prediction_index", "detected_at", "adwin_delta", "adwin_clock"]
-    pd.DataFrame(event_rows, columns=event_columns).to_csv(output / "drift_events.csv", index=False)
-    recovery_columns = ["run_id", "dataset", "strategy", "seed", "drift_index",
-                        "baseline_accuracy", "threshold", "recovery_index",
-                        "recovery_time", "status"]
-    pd.DataFrame(recovery_rows, columns=recovery_columns).to_csv(
-        output / "recoveries.csv", index=False)
+    _checkpoint(output, raw)
     print(f"Phase 3 outputs: {output}")
     return output, raw, summary
 
@@ -260,9 +310,11 @@ def main():
     mode.add_argument("--pilot", action="store_true",
                       help="run the full configured dataset/strategy matrix with seed 42 only")
     parser.add_argument("--no-mlflow", action="store_true")
+    parser.add_argument("--resume", metavar="OUTPUT_DIRECTORY",
+                        help="resume an existing Phase 3 output directory using its config.yaml")
     args = parser.parse_args()
     run(args.config, smoke=args.smoke, pilot=args.pilot,
-        log_to_mlflow=not args.no_mlflow)
+        log_to_mlflow=not args.no_mlflow, resume=args.resume)
 
 
 if __name__ == "__main__":
