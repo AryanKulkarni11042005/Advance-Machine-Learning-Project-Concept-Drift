@@ -96,7 +96,7 @@ def sea_gradual(n_per_concept=5000, transition=1000, variants=(3, 2), seed=42):
     return samples, drift_points
 
 
-def elec2(seed=None):
+def elec2(n_samples=45_312, seed=None):
     """Electricity market (NSW), 45,312 samples, 8 numeric features.
 
     Real-world stream with gradual and recurring drift from demand cycles.
@@ -104,7 +104,8 @@ def elec2(seed=None):
     is not reported for this stream. `seed` is accepted and ignored - the rows
     are fixed and always in the same temporal order.
     """
-    return list(datasets.Elec2()), []
+    samples = list(datasets.Elec2())
+    return samples[:n_samples], []
 
 
 def airlines(n_samples=100_000, seed=None):
@@ -152,7 +153,17 @@ STREAMS = {
 }
 
 
-def stock_sp500(csv="stock_market_cleaned.csv", seed=None, scale_free=True):
+def load_stream(name, seed=42, **stream_config):
+    """Build a registered stream with explicit, recorded generator arguments."""
+    try:
+        generator = STREAMS[name]
+    except KeyError as exc:
+        raise ValueError(f"unknown dataset: {name}") from exc
+    return generator(seed=seed, **stream_config)
+
+
+def stock_sp500(csv="stock_market_cleaned.csv", seed=None, scale_free=True,
+                n_samples=None):
     """S&P 500 daily direction, 2005-2024. Fixed rows in temporal order.
 
     Real-world stream with no ground-truth drift index, so drift_points is
@@ -200,6 +211,8 @@ def stock_sp500(csv="stock_market_cleaned.csv", seed=None, scale_free=True):
     df = df.dropna(subset=feats + ["target"]).reset_index(drop=True)
     samples = [({f: float(r[f]) for f in feats}, int(r["target"]))
                for _, r in df.iterrows()]
+    if n_samples is not None:
+        samples = samples[:n_samples]
     return samples, []
 
 

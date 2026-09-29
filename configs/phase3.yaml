@@ -1,0 +1,71 @@
+experiment:
+  version: phase3a
+  run_id: auto
+  output_root: results/phase3
+  mlflow_experiment: concept-drift-phase3a
+  eval_every: 200
+  recovery_tolerance: 0.02
+
+seeds: [42, 43, 44, 45, 46]
+
+strategies:
+  - baseline
+  - blind_periodic
+  - detector_full_retrain
+  - detector_incremental
+  - arf
+  - lstm
+  - lstm_adwin_reset
+  - lstm_adwin_finetune
+  - gru
+  - gru_adwin_reset
+  - gru_adwin_finetune
+
+model:
+  sequence_length: 10
+  hidden_size: 16
+  optimizer: Adam
+  learning_rate: 0.01
+  update_steps: 1
+  replay_size: 32
+
+adwin:
+  delta: 0.002
+  clock: 32
+
+airlines_hashing:
+  buckets_per_feature: 32
+  categorical_features: [Airline, AirportFrom, AirportTo, DayOfWeek]
+  hash: blake2b-64
+  numeric_transform: signed_log1p
+
+datasets:
+  sea_abrupt:
+    stream: {n_per_concept: 5000, variants: [3, 2]}
+    label_delay: 0
+  sea_gradual:
+    stream: {n_per_concept: 5000, transition: 1000, variants: [3, 2]}
+    label_delay: 0
+  hyperplane:
+    stream: {n_samples: 10000, n_features: 10, n_drift_features: 5, mag_change: 0.001}
+    label_delay: 0
+  elec2:
+    stream: {n_samples: 45312}
+    label_delay: 0
+  airlines:
+    stream: {n_samples: 100000}
+    label_delay: 0
+  stock_sp500:
+    stream: {csv: stock_market_cleaned.csv, scale_free: true, n_samples: null}
+    label_delay: 1
+
+# Every dataset/strategy pair is declared. No implicit exclusions or skips.
+# Airlines uses the causal neural-only hashing encoder; S&P500 uses delayed
+# label feedback for both River and neural detector strategies.
+eligibility:
+  sea_abrupt: [baseline, blind_periodic, detector_full_retrain, detector_incremental, arf, lstm, lstm_adwin_reset, lstm_adwin_finetune, gru, gru_adwin_reset, gru_adwin_finetune]
+  sea_gradual: [baseline, blind_periodic, detector_full_retrain, detector_incremental, arf, lstm, lstm_adwin_reset, lstm_adwin_finetune, gru, gru_adwin_reset, gru_adwin_finetune]
+  hyperplane: [baseline, blind_periodic, detector_full_retrain, detector_incremental, arf, lstm, lstm_adwin_reset, lstm_adwin_finetune, gru, gru_adwin_reset, gru_adwin_finetune]
+  elec2: [baseline, blind_periodic, detector_full_retrain, detector_incremental, arf, lstm, lstm_adwin_reset, lstm_adwin_finetune, gru, gru_adwin_reset, gru_adwin_finetune]
+  airlines: [baseline, blind_periodic, detector_full_retrain, detector_incremental, arf, lstm, lstm_adwin_reset, lstm_adwin_finetune, gru, gru_adwin_reset, gru_adwin_finetune]
+  stock_sp500: [baseline, blind_periodic, detector_full_retrain, detector_incremental, arf, lstm, lstm_adwin_reset, lstm_adwin_finetune, gru, gru_adwin_reset, gru_adwin_finetune]

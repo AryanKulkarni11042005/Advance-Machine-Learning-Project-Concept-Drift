@@ -1,8 +1,11 @@
 # src/pipeline.py
 """Prequential (test-then-train) evaluation of drift adaptation strategies."""
 import pathlib
+import hashlib
+import math
 import tracemalloc
 from collections import Counter, deque
+from numbers import Real
 from time import perf_counter
 
 import mlflow
@@ -46,9 +49,8 @@ STRATEGIES = {
     "arf": dict(model_fn=lambda seed=None: forest.ARFClassifier(seed=seed)),
 }
 
-# Kept separate so the existing full benchmark grid remains unchanged. Neural
-# strategies are opt-in until categorical preprocessing and adaptation policy
-# are designed in a later phase.
+# Kept separate so the existing default benchmark grid remains unchanged.
+# The dedicated Phase 3 runner opts into these strategies explicitly.
 NEURAL_STRATEGIES = {
     "lstm": dict(architecture="lstm", adaptation="online"),
     "gru": dict(architecture="gru", adaptation="online"),
@@ -83,9 +85,64 @@ def recovery_time(curve, drift_idx, tolerance=0.02):
     return None
 
 
+class AirlinesNeuralEncoder:
+    """Fixed-width, causal representation for Airlines neural models only.
+
+    Categories are hashed independently within feature-specific bucket blocks;
+    numeric features use a fixed signed-log transform. No vocabulary or scale
+    is fitted from the stream, so later observations cannot affect earlier rows.
+    """
+
+    def __init__(self, feature_names, categorical_features, buckets_per_feature=32):
+        self.feature_names = tuple(feature_names)
+        self.categorical_features = tuple(
+            name for name in self.feature_names if name in categorical_features
+        )
+        self.numeric_features = tuple(
+            name for name in self.feature_names if name not in categorical_features
+        )
+        self.buckets_per_feature = int(buckets_per_feature)
+        if self.buckets_per_feature < 1:
+            raise ValueError("buckets_per_feature must be positive")
+        self.input_size = len(self.numeric_features) + (
+            len(self.categorical_features) * self.buckets_per_feature
+        )
+        self.metadata = {
+            "type": "causal_feature_hash",
+            "hash": "blake2b-64",
+            "buckets_per_categorical_feature": self.buckets_per_feature,
+            "categorical_features": list(self.categorical_features),
+            "numeric_features": list(self.numeric_features),
+            "numeric_transform": "signed_log1p",
+            "vocabulary_fitted": False,
+            "label_dependent": False,
+        }
+
+    def transform(self, features):
+        out = []
+        for name in self.numeric_features:
+            value = features[name]
+            if not isinstance(value, Real):
+                raise TypeError(f"numeric feature {name!r} is not numeric")
+            value = float(value)
+            out.append(math.copysign(math.log1p(abs(value)), value))
+        for name in self.categorical_features:
+            value = str(features[name])
+            token = f"{name}\0{value}".encode("utf-8")
+            bucket = int.from_bytes(hashlib.blake2b(token, digest_size=8).digest(),
+                                    "big") % self.buckets_per_feature
+            block = [0.0] * self.buckets_per_feature
+            block[bucket] = 1.0
+            out.extend(block)
+        return {f"encoded_{i}": value for i, value in enumerate(out)}
+
+
 def run_strategy(samples, strategy_name, dataset_name, drift_points=(),
                  seed=42, window=500, eval_every=200, log_to_mlflow=True,
-                 delay=0):
+                 delay=0, adwin_config=None, model_config=None,
+                 dataset_config=None, run_id=None, experiment_version=None,
+                 mlflow_experiment=None, airline_hash_config=None,
+                 recovery_tolerance=0.02):
     """Run one (dataset, strategy, seed) configuration prequentially.
 
     delay: how many steps to hold a sample before learning from it. Use this
@@ -99,15 +156,35 @@ def run_strategy(samples, strategy_name, dataset_name, drift_points=(),
     Returns a dict of results; also logs params and metrics to MLflow.
     """
     neural_cfg = NEURAL_STRATEGIES.get(strategy_name)
+    model_config = dict(model_config or {})
+    adwin_config = dict(adwin_config or {})
+    airline_hash_config = dict(airline_hash_config or {})
+    encoder = None
     if neural_cfg:
         first_features = samples[0][0]
+        if dataset_name == "airlines":
+            categorical = airline_hash_config.get(
+                "categorical_features",
+                ("Airline", "AirportFrom", "AirportTo", "DayOfWeek"),
+            )
+            encoder = AirlinesNeuralEncoder(
+                first_features.keys(), categorical,
+                airline_hash_config.get("buckets_per_feature", 32),
+            )
+            first_features = encoder.transform(first_features)
         feature_names = tuple(first_features.keys())
-        sequence_builder = RollingSequence(sequence_length=10,
+        sequence_length = int(model_config.get("sequence_length", 10))
+        sequence_builder = RollingSequence(sequence_length=sequence_length,
                                            feature_names=feature_names)
         model = NeuralAdapter(
             architecture=neural_cfg["architecture"],
-            input_size=len(feature_names), seed=seed, sequence_length=10,
+            input_size=len(feature_names), seed=seed,
+            hidden_size=int(model_config.get("hidden_size", 16)),
+            learning_rate=float(model_config.get("learning_rate", 0.01)),
+            sequence_length=sequence_length,
         )
+        if int(model_config.get("update_steps", 1)) != 1:
+            raise ValueError("Phase 3 currently supports exactly one update step per label")
         neural_buffer = deque(maxlen=neural_cfg.get("replay_buffer_size", 32))
         model_fn = None
         cfg = {}
@@ -120,7 +197,9 @@ def run_strategy(samples, strategy_name, dataset_name, drift_points=(),
         sequence_builder = None
     detector_enabled = (neural_cfg.get("detector", False) if neural_cfg
                         else cfg.get("detector", False))
-    detector = ADWIN() if detector_enabled else None
+    detector = (ADWIN(delta=float(adwin_config.get("delta", 0.002)),
+                      clock=int(adwin_config.get("clock", 32)))
+                if detector_enabled else None)
     reset_on_drift = cfg.get("reset_on_drift", False)
     refit_on_reset = cfg.get("refit_on_reset", False)
     retrain_every = cfg.get("retrain_every")
@@ -136,53 +215,52 @@ def run_strategy(samples, strategy_name, dataset_name, drift_points=(),
     majority_baseline = max(_labels.values()) / sum(_labels.values())
 
     detected_drifts = []
+    drift_events = []
+    detector_feedback = []
     valid_predictions = 0
     curve = []          # (index, windowed accuracy) - windowed, so a local
     win_correct = win_n = 0   # dip at the drift is visible instead of averaged away
     pending = deque()   # samples awaiting their label under `delay`
 
-    def adapt_neural_from_error(error, detection_index):
+    def adapt_from_error(error, feedback_index, prediction_index):
+        nonlocal model
         if detector is None or error is None:
             return
+        detector_feedback.append({"feedback_index": int(feedback_index),
+                                  "prediction_index": int(prediction_index),
+                                  "error": int(error)})
         detector.update(error)
         if detector.drift_detected:
-            detected_drifts.append(detection_index)
-            if neural_cfg["adaptation"] == "adwin_reset":
-                model.reset()
-            elif neural_cfg["adaptation"] == "adwin_finetune":
-                # Replay only labels already revealed before this detection.
-                for buffered_sequence, buffered_label in neural_buffer:
-                    model.update(buffered_sequence, buffered_label)
+            detected_drifts.append(int(feedback_index))
+            drift_events.append({
+                "feedback_index": int(feedback_index),
+                "prediction_index": int(prediction_index),
+                "detected_at": int(feedback_index),
+            })
+            if neural_cfg:
+                if neural_cfg["adaptation"] == "adwin_reset":
+                    model.reset()
+                elif neural_cfg["adaptation"] == "adwin_finetune":
+                    # Only examples whose labels were revealed earlier.
+                    for buffered_sequence, buffered_label in neural_buffer:
+                        model.update(buffered_sequence, buffered_label)
+            elif reset_on_drift:
+                model = model_fn()
+                if refit_on_reset:
+                    for bx, by in buffer:
+                        model.learn_one(bx, by)
 
     tracemalloc.start()
     start = perf_counter()
 
     for i, (x, y) in enumerate(samples):
         if sequence_builder:
-            sequence = sequence_builder.append(x)
+            neural_x = encoder.transform(x) if encoder else x
+            sequence = sequence_builder.append(neural_x)
             y_pred = model.predict(sequence) if sequence is not None else None
         else:
             sequence = None
             y_pred = model.predict_one(x)
-
-        if y_pred is not None:
-            valid_predictions += 1
-            acc.update(y, y_pred)
-            f1.update(y, y_pred)
-            win_correct += int(y_pred == y)
-            win_n += 1
-            # Feed the detector only on real predictions. Counting the warmup
-            # (y_pred is None) as an error would inject a false error signal
-            # and can trip the detector before any drift exists.
-            if detector is not None and not sequence_builder:
-                detector.update(int(y_pred != y))
-                if detector.drift_detected:
-                    detected_drifts.append(i)
-                    if reset_on_drift:
-                        model = model_fn()
-                        if refit_on_reset:
-                            for bx, by in buffer:
-                                model.learn_one(bx, by)
 
         if retrain_every and i > 0 and i % retrain_every == 0:
             model = model_fn()
@@ -190,40 +268,33 @@ def run_strategy(samples, strategy_name, dataset_name, drift_points=(),
                 for bx, by in buffer:
                     model.learn_one(bx, by)
 
-        # Under delay>0 the pair (x, y) is not learnable yet: at time i its
-        # label still lies in the future. Hold it and learn it once it would
-        # genuinely be known.
-        if delay:
+        # Queue every learnable sample, even when River cannot yet predict a
+        # class. Its label must still be revealed and learned; only scoring
+        # and ADWIN feedback require a valid prediction.
+        if not sequence_builder or sequence is not None:
+            pending.append({"x": x, "sequence": sequence, "label": y,
+                            "prediction": y_pred, "prediction_index": i})
+
+        # delay=0 reveals the current item after its prediction. For delayed
+        # streams, predict the current item first, then resolve prior labels.
+        while len(pending) > delay:
+            item = pending.popleft()
+            label = item["label"]
+            prediction = item["prediction"]
+            if prediction is not None:
+                valid_predictions += 1
+                acc.update(label, prediction)
+                f1.update(label, prediction)
+                win_correct += int(prediction == label)
+                win_n += 1
+                adapt_from_error(int(prediction != label), i,
+                                 item["prediction_index"])
             if sequence_builder:
-                if sequence is not None:
-                    # Score immediately as the existing prequential loop does,
-                    # but withhold detector feedback and training until label
-                    # arrival. This prevents delayed labels from leaking.
-                    pending.append((sequence, y,
-                                    int(y_pred != y) if y_pred is not None else None))
+                model.update(item["sequence"], label)
+                neural_buffer.append((item["sequence"], label))
             else:
-                pending.append((x, y))
-            if len(pending) > delay:
-                item = pending.popleft()
-                if sequence_builder:
-                    lx, ly, error = item
-                    adapt_neural_from_error(error, i)
-                    model.update(lx, ly)
-                    neural_buffer.append((lx, ly))
-                else:
-                    lx, ly = item
-                    model.learn_one(lx, ly)
-                    buffer.append((lx, ly))
-        else:
-            if sequence_builder:
-                if sequence is not None:
-                    if detector is not None:
-                        adapt_neural_from_error(int(y_pred != y), i)
-                    model.update(sequence, y)
-                    neural_buffer.append((sequence, y))
-            else:
-                model.learn_one(x, y)
-                buffer.append((x, y))
+                model.learn_one(item["x"], label)
+                buffer.append((item["x"], label))
 
         if win_n and (i + 1) % eval_every == 0:
             curve.append((i + 1, win_correct / win_n))
@@ -233,8 +304,34 @@ def run_strategy(samples, strategy_name, dataset_name, drift_points=(),
     _, peak = tracemalloc.get_traced_memory()
     tracemalloc.stop()
 
-    recoveries = [recovery_time(curve, d) for d in drift_points]
-    measured = [r for r in recoveries if r is not None]
+    recoveries = []
+    for drift_idx in drift_points:
+        pre = [a for idx, a in curve if idx < drift_idx]
+        if not pre:
+            recoveries.append({"drift_index": int(drift_idx),
+                               "baseline_accuracy": None, "threshold": None,
+                               "recovery_index": None, "recovery_time": None,
+                               "status": "no_pre_drift_baseline"})
+            continue
+        baseline = pre[-1]
+        threshold = baseline - recovery_tolerance
+        recovered_idx = next((idx for idx, value in curve
+                              if idx > drift_idx and value >= threshold), None)
+        recoveries.append({
+            "drift_index": int(drift_idx),
+            "baseline_accuracy": float(baseline),
+            "threshold": float(threshold),
+            "recovery_index": (int(recovered_idx) if recovered_idx is not None else None),
+            "recovery_time": (int(recovered_idx - drift_idx)
+                              if recovered_idx is not None else None),
+            "status": "recovered" if recovered_idx is not None else "no_recovery",
+        })
+    if not drift_points:
+        recoveries.append({"drift_index": None, "baseline_accuracy": None,
+                           "threshold": None, "recovery_index": None,
+                           "recovery_time": None, "status": "not_applicable"})
+    measured = [r["recovery_time"] for r in recoveries
+                if r["status"] == "recovered"]
 
     results = {
         "dataset": dataset_name,
@@ -247,17 +344,29 @@ def run_strategy(samples, strategy_name, dataset_name, drift_points=(),
         "n_drift_detections": len(detected_drifts),
         "n_valid_predictions": valid_predictions,
         "detected_drifts": detected_drifts,
+        "drift_events": drift_events,
+        "detector_feedback": detector_feedback,
         "majority_baseline": majority_baseline,
         "lift_over_majority": acc.get() - majority_baseline,
-        "recoveries": recoveries,
+        "recoveries": [r["recovery_time"] for r in recoveries
+                       if r["status"] != "not_applicable"],
+        "recovery_records": recoveries,
         "curve": curve,
+        "mean_recovery": (sum(measured) / len(measured) if measured else None),
+        "n_recovered": len(measured),
+        "dataset_config": dataset_config or {},
+        "airlines_encoder": encoder.metadata if encoder else None,
+        "adwin_config": (dict(adwin_config) if detector is not None else None),
+        "model_config": model_config if sequence_builder else {},
     }
 
     if log_to_mlflow:
         mlflow.set_tracking_uri(TRACKING_URI)
-        mlflow.set_experiment(EXPERIMENT)
+        mlflow.set_experiment(mlflow_experiment or EXPERIMENT)
         with mlflow.start_run(run_name=f"{dataset_name}_{strategy_name}_s{seed}"):
             mlflow.log_params({
+                "run_id": run_id or "legacy",
+                "experiment_version": experiment_version or "legacy",
                 "dataset": dataset_name,
                 "strategy": strategy_name,
                 "base_learner": (model.metadata["model_type"] if sequence_builder
@@ -266,9 +375,13 @@ def run_strategy(samples, strategy_name, dataset_name, drift_points=(),
                 "window": window,
                 "retrain_every": retrain_every,
                 "detector": "ADWIN" if detector is not None else None,
+                "adwin_delta": adwin_config.get("delta", 0.002) if detector is not None else None,
+                "adwin_clock": adwin_config.get("clock", 32) if detector is not None else None,
                 "n_samples": len(samples),
                 "delay": delay,
                 "true_drift_points": list(drift_points),
+                "dataset_configuration": str(dataset_config or {})[:450],
+                "recovery_tolerance": recovery_tolerance,
             })
             if sequence_builder:
                 mlflow.log_params({
@@ -281,6 +394,8 @@ def run_strategy(samples, strategy_name, dataset_name, drift_points=(),
                     "update_steps_per_label": model.metadata["updates_per_label"],
                     "replay_buffer_size": neural_cfg.get("replay_buffer_size", 0),
                 })
+                if encoder:
+                    mlflow.log_params({"airlines_encoder": str(encoder.metadata)[:450]})
             for idx, a in curve:
                 mlflow.log_metric("windowed_accuracy", a, step=idx)
             mlflow.log_metrics({
@@ -301,5 +416,8 @@ def run_strategy(samples, strategy_name, dataset_name, drift_points=(),
                                   sum(measured) / len(measured))
             if drift_points:
                 mlflow.log_metric("n_recovered", len(measured))
+            if run_id:
+                mlflow.set_tags({"phase3_run_id": run_id,
+                                 "experiment_version": experiment_version or "phase3"})
 
     return results
