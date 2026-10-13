@@ -142,7 +142,8 @@ def run_strategy(samples, strategy_name, dataset_name, drift_points=(),
                  delay=0, adwin_config=None, model_config=None,
                  dataset_config=None, run_id=None, experiment_version=None,
                  mlflow_experiment=None, airline_hash_config=None,
-                 recovery_tolerance=0.02):
+                 recovery_tolerance=0.02, mlflow_extra_params=None,
+                 mlflow_run_name=None):
     """Run one (dataset, strategy, seed) configuration prequentially.
 
     delay: how many steps to hold a sample before learning from it. Use this
@@ -363,8 +364,9 @@ def run_strategy(samples, strategy_name, dataset_name, drift_points=(),
     if log_to_mlflow:
         mlflow.set_tracking_uri(TRACKING_URI)
         mlflow.set_experiment(mlflow_experiment or EXPERIMENT)
-        with mlflow.start_run(run_name=f"{dataset_name}_{strategy_name}_s{seed}"):
-            mlflow.log_params({
+        with mlflow.start_run(
+                run_name=mlflow_run_name or f"{dataset_name}_{strategy_name}_s{seed}"):
+            params = {
                 "run_id": run_id or "legacy",
                 "experiment_version": experiment_version or "legacy",
                 "dataset": dataset_name,
@@ -382,7 +384,9 @@ def run_strategy(samples, strategy_name, dataset_name, drift_points=(),
                 "true_drift_points": list(drift_points),
                 "dataset_configuration": str(dataset_config or {})[:450],
                 "recovery_tolerance": recovery_tolerance,
-            })
+            }
+            params.update(mlflow_extra_params or {})
+            mlflow.log_params(params)
             if sequence_builder:
                 mlflow.log_params({
                     "model_family": model.metadata["model_type"],
@@ -417,7 +421,8 @@ def run_strategy(samples, strategy_name, dataset_name, drift_points=(),
             if drift_points:
                 mlflow.log_metric("n_recovered", len(measured))
             if run_id:
-                mlflow.set_tags({"phase3_run_id": run_id,
+                phase = int((mlflow_extra_params or {}).get("phase", 3))
+                mlflow.set_tags({f"phase{phase}_run_id": run_id,
                                  "experiment_version": experiment_version or "phase3"})
 
     return results
