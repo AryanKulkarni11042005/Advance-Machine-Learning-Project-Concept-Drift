@@ -274,5 +274,6 @@ There is no project bibliography file in the repository. The following foundatio
 6. K. Cho et al. “Learning Phrase Representations using RNN Encoder–Decoder for Statistical Machine Translation.” *Proceedings of EMNLP 2014*, 1724–1734, 2014. [ACL Anthology D14-1179](https://aclanthology.org/D14-1179/).
 
 ## License
+[![License: MIT](https://shields.io)](LICENSE.md)
 
 This project is licensed under the MIT License; see [LICENSE.md](LICENSE.md).
