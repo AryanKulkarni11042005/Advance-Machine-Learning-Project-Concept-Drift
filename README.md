@@ -15,19 +15,22 @@ Which concept-drift adaptation strategy restores predictive performance most eff
 | 1 | Complete | Baseline streaming benchmark infrastructure |
 | 2 | Complete | LSTM and GRU online adaptation integration |
 | 3 | Complete | Multi-dataset benchmark: 330 runs across six datasets and eleven strategies |
-| 4 | Next | Controlled ablation and sensitivity analysis |
-| 5 | Planned | Statistical analysis |
-| 6 | Planned | Visualization |
+| 4 | Complete | Week 4 controlled ablation and ADWIN sensitivity analysis for recurrent architectures |
+| 5 | Complete | Statistical analysis with paired comparisons and effect summaries |
+| 6 | Complete (plot-ready data) | Visualization inputs generated as CSVs for accuracy, runtime, and recovery plots |
 | 7 | Planned | Research paper and documentation |
 
-Phase 4 and later work have not been run as part of the reported Phase 3 results.
+The Week 4 / Phase 4 study is complete and stored under `results/phase4/phase4_20260929_233350/`. The analysis folder contains the statistical outputs (`paired_comparisons.csv`, `adaptation_policy_effect.csv`, `condition_summary.csv`, etc.) and plot-ready CSVs (`plot_accuracy.csv`, `plot_runtime.csv`, `plot_macro_f1.csv`, `plot_recovery.csv`, `plot_adwin.csv`). There are no rendered PNG/SVG figure files in the repository, but the analysis artifacts are present and ready for plotting or reporting.
+
+The Phase 3 results remain the project baseline, while the Phase 4 study isolates architecture and detector sensitivity to answer whether ADWIN-triggered intervention helps or hurts recurrent online learners.
 
 ## Repository structure
 
 ```text
 .
 ├── configs/
-│   └── phase3.yaml                 # Frozen Phase 3 matrix and model settings
+│   ├── phase3.yaml                 # Frozen Phase 3 matrix and model settings
+│   └── phase4.yaml                 # Phase 4 architecture and ADWIN sensitivity ablation
 ├── data/                           # Local cached data, including Airlines parquet
 ├── docs/
 │   └── findings.md                 # Earlier working notes; see final Phase 3 artifacts
@@ -37,8 +40,10 @@ Phase 4 and later work have not been run as part of the reported Phase 3 results
 │   ├── stock_market.ipynb          # Stock data exploration
 │   └── stock_market_cleaned.csv     # Prepared stock stream input
 ├── results/
-│   └── phase3/
-│       └── phase3_20260929_121546/ # Final Phase 3 artifacts
+│   ├── phase3/
+│   │   └── phase3_20260929_121546/ # Final Phase 3 artifacts
+│   └── phase4/
+│       └── phase4_20260929_233350/ # Final Phase 4 ablation artifacts
 ├── scripts/
 │   ├── download_data.py            # Fetch/cache real-world data
 │   ├── experiment_neural_drift.py  # Small neural drift experiment
@@ -59,7 +64,7 @@ Phase 4 and later work have not been run as part of the reported Phase 3 results
 └── README.md
 ```
 
-The Phase 3 deliverables are in `results/phase3/phase3_20260929_121546/`. The legacy exporter can create `results/raw_runs.csv` and `results/summary.csv`; those files are not present in the current checkout and are separate from the Phase 3 run outputs. The `data/` directory and local MLflow SQLite database are machine-local inputs/state.
+The Phase 3 deliverables are in `results/phase3/phase3_20260929_121546/`, and the Phase 4 ablation artifacts are in `results/phase4/phase4_20260929_233350/`. The legacy exporter can create `results/raw_runs.csv` and `results/summary.csv`; those files are not present in the current checkout and are separate from the final run outputs. The `data/` directory and local MLflow SQLite database are machine-local inputs/state.
 
 ## Implemented methodology
 
@@ -207,16 +212,55 @@ mlflow ui --backend-store-uri sqlite:///mlflow.db
 - Runtime and memory measurements depend on the execution environment.
 - Phase 3 uses one configured ADWIN sensitivity (`delta: 0.002`); it is not a detector or hyperparameter sweep.
 
-## Next: Phase 4
+## Phase 4 benchmark and results
 
-Phase 4 is planned controlled ablation and sensitivity analysis. The work will keep other factors fixed while varying the adaptation policy and model family. Planned comparisons include:
+The Week 4 / Phase 4 study is complete and stored under `results/phase4/phase4_20260929_233350/`. It was designed as a focused controlled ablation on recurrent architectures and ADWIN intervention policies, while keeping the stream setup and learner structure fixed.
 
-1. LSTM versus GRU.
-2. Online neural adaptation versus ADWIN reset versus ADWIN fine-tuning.
-3. ADWIN sensitivity at values such as `delta` = 0.001, 0.002, and 0.005.
-4. Potentially, DDM as an additional detector if time and resources permit.
+### Phase 4 scope
 
-These are future experiments; no Phase 4 results are reported here.
+The Phase 4 configuration in `configs/phase4.yaml` evaluates:
+
+- Datasets: `sea_abrupt`, `sea_gradual`, and `hyperplane`
+- Strategies: `lstm`, `lstm_adwin_reset`, `lstm_adwin_finetune`, `gru`, `gru_adwin_reset`, `gru_adwin_finetune`
+- ADWIN deltas: 0.001, 0.002, and 0.005
+- Seeds: 42, 43, 44, 45, 46
+- Total expected runs: 210 (`3 datasets × 14 conditions × 5 seeds`)
+
+This makes Phase 4 a precisely scoped architecture-and-detector sensitivity analysis rather than a broad benchmark sweep. The study asks whether ADWIN-triggered adaptation helps recurrent learners, and whether the answer depends on model family or detector sensitivity.
+
+### Phase 4 observations
+
+The phase-4 output files contain the final run-level records, summary, recovery records, and analysis tables. The key descriptive findings are as follows:
+
+- On `sea_abrupt`, the online LSTM was already very strong: mean accuracy was about 0.949975, with macro-F1 about 0.944303.
+- LSTM fine-tuning produced a small gain at selected deltas, with the best mean accuracy around 0.950555 (`lstm_adwin_finetune`, `delta=0.002`).
+- On `sea_gradual`, online LSTM remained competitive at about 0.947703 accuracy and 0.941796 macro-F1; fine-tuned variants were effectively tied with the online baseline.
+- On `hyperplane`, LSTM online achieved about 0.881313 accuracy and 0.881278 macro-F1, while the best fine-tuned result was about 0.882014 (`delta=0.001`), a very small improvement.
+- ADWIN reset was consistently worse than online adaptation or fine-tuning. On synthetic streams, it triggered far more often and degraded accuracy substantially. For example, on `hyperplane`, `lstm_adwin_reset` ranged from about 0.688 to 0.729 accuracy depending on the delta, versus about 0.881 for the online LSTM.
+- GRU behaved similarly: online GRU was strong on both SEA streams, and fine-tuning offered only marginal gains. Resetting on ADWIN was again worse than not resetting.
+- Increasing `delta` changed detector sensitivity modestly, but there was no universal winner across all streams; the differences were smaller than the effect of the adaptation policy itself.
+- For `hyperplane`, recovery metrics are not applicable because the stream does not have a discrete known drift index. The benchmark therefore relies on accuracy and macro-F1 rather than recovery time for this dataset.
+
+### Interpretation
+
+The Week 4 study clarifies an important practical point: for these recurrent neural classifiers, the simplest online learner is extremely competitive, and ADWIN-triggered reset can materially hurt performance by reinitializing on a stream where the model is still useful. Fine-tuning is a safer detector policy than full reset, but its gains are often small enough that the online learner remains a strong baseline.
+
+This result is consistent with the broader project conclusion: drift adaptation is not universally beneficial, and its value depends on drift type, model family, and the detector policy used to trigger intervention.
+
+## Statistical analysis and plotting artifacts
+
+The project already contains the statistical analysis artifacts in `results/phase4/phase4_20260929_233350/analysis/`.
+
+Included files:
+
+- `paired_comparisons.csv` — paired non-parametric comparisons across matched seeds
+- `adaptation_policy_effect.csv` — effect summaries for adaptation-policy interventions
+- `architecture_effect.csv` — architecture-level effect comparisons
+- `detector_sensitivity_effect.csv` — ADWIN-sensitivity effect summaries
+- `dataset_summary.csv` and `condition_summary.csv` — dataset/condition summaries
+- `plot_accuracy.csv`, `plot_macro_f1.csv`, `plot_runtime.csv`, `plot_recovery.csv`, `plot_adwin.csv` — plot-ready numeric data for visualization
+
+These are analysis and plotting artifacts rather than rendered charts. The repository therefore already has the evidence for statistical interpretation and figure generation, even though the final image files are not present as standalone `.png` or `.svg` assets.
 
 ## Selected references
 
