@@ -1,0 +1,137 @@
+metadata:
+  phase: 4
+  purpose: neural architecture/adaptation ablation and ADWIN sensitivity
+  datasets: [sea_abrupt, sea_gradual, hyperplane]
+  strategies: [lstm, lstm_adwin_reset, lstm_adwin_finetune, gru, gru_adwin_reset, gru_adwin_finetune]
+  adwin_deltas: [0.001, 0.002, 0.005]
+  seeds: [42, 43, 44, 45, 46]
+  expected_runs: 210
+
+experiment:
+  version: phase4_ablation
+  run_id: auto
+  output_root: results/phase4
+  mlflow_experiment: concept-drift-phase4
+  eval_every: 200
+  recovery_tolerance: 0.02
+
+seeds: [42, 43, 44, 45, 46]
+
+model:
+  sequence_length: 10
+  hidden_size: 16
+  optimizer: Adam
+  learning_rate: 0.01
+  update_steps: 1
+  replay_size: 32
+
+adwin:
+  deltas: [0.001, 0.002, 0.005]
+  clock: 32
+
+# Retained from Phase 3 for configuration continuity. These synthetic datasets
+# use numeric features and do not invoke the Airlines encoder.
+airlines_hashing:
+  buckets_per_feature: 32
+  categorical_features: [Airline, AirportFrom, AirportTo, DayOfWeek]
+  hash: blake2b-64
+  numeric_transform: signed_log1p
+
+datasets:
+  sea_abrupt:
+    stream: {n_per_concept: 5000, variants: [3, 2]}
+    label_delay: 0
+  sea_gradual:
+    stream: {n_per_concept: 5000, transition: 1000, variants: [3, 2]}
+    label_delay: 0
+  hyperplane:
+    stream: {n_samples: 10000, n_features: 10, n_drift_features: 5, mag_change: 0.001}
+    label_delay: 0
+
+# One record is one executable condition. Online strategies have no detector
+# and therefore no delta or clock; detector conditions expand over all deltas.
+conditions:
+  - condition_id: lstm_online
+    strategy: lstm
+    architecture: lstm
+    adaptation_policy: online
+    adwin_delta: null
+    adwin_clock: null
+  - condition_id: lstm_adwin_reset_d001
+    strategy: lstm_adwin_reset
+    architecture: lstm
+    adaptation_policy: adwin_reset
+    adwin_delta: 0.001
+    adwin_clock: 32
+  - condition_id: lstm_adwin_reset_d002
+    strategy: lstm_adwin_reset
+    architecture: lstm
+    adaptation_policy: adwin_reset
+    adwin_delta: 0.002
+    adwin_clock: 32
+  - condition_id: lstm_adwin_reset_d005
+    strategy: lstm_adwin_reset
+    architecture: lstm
+    adaptation_policy: adwin_reset
+    adwin_delta: 0.005
+    adwin_clock: 32
+  - condition_id: lstm_adwin_finetune_d001
+    strategy: lstm_adwin_finetune
+    architecture: lstm
+    adaptation_policy: adwin_finetune
+    adwin_delta: 0.001
+    adwin_clock: 32
+  - condition_id: lstm_adwin_finetune_d002
+    strategy: lstm_adwin_finetune
+    architecture: lstm
+    adaptation_policy: adwin_finetune
+    adwin_delta: 0.002
+    adwin_clock: 32
+  - condition_id: lstm_adwin_finetune_d005
+    strategy: lstm_adwin_finetune
+    architecture: lstm
+    adaptation_policy: adwin_finetune
+    adwin_delta: 0.005
+    adwin_clock: 32
+  - condition_id: gru_online
+    strategy: gru
+    architecture: gru
+    adaptation_policy: online
+    adwin_delta: null
+    adwin_clock: null
+  - condition_id: gru_adwin_reset_d001
+    strategy: gru_adwin_reset
+    architecture: gru
+    adaptation_policy: adwin_reset
+    adwin_delta: 0.001
+    adwin_clock: 32
+  - condition_id: gru_adwin_reset_d002
+    strategy: gru_adwin_reset
+    architecture: gru
+    adaptation_policy: adwin_reset
+    adwin_delta: 0.002
+    adwin_clock: 32
+  - condition_id: gru_adwin_reset_d005
+    strategy: gru_adwin_reset
+    architecture: gru
+    adaptation_policy: adwin_reset
+    adwin_delta: 0.005
+    adwin_clock: 32
+  - condition_id: gru_adwin_finetune_d001
+    strategy: gru_adwin_finetune
+    architecture: gru
+    adaptation_policy: adwin_finetune
+    adwin_delta: 0.001
+    adwin_clock: 32
+  - condition_id: gru_adwin_finetune_d002
+    strategy: gru_adwin_finetune
+    architecture: gru
+    adaptation_policy: adwin_finetune
+    adwin_delta: 0.002
+    adwin_clock: 32
+  - condition_id: gru_adwin_finetune_d005
+    strategy: gru_adwin_finetune
+    architecture: gru
+    adaptation_policy: adwin_finetune
+    adwin_delta: 0.005
+    adwin_clock: 32

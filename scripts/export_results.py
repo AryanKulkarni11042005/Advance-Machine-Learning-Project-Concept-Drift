@@ -10,6 +10,7 @@ left stale or half-written.
 """
 import pathlib
 import sys
+import argparse
 
 import mlflow
 import pandas as pd
@@ -78,5 +79,27 @@ def export():
     return df, agg
 
 
+def export_phase3(run_dir):
+    """Rebuild the Phase 3 summary without mixing it with legacy results."""
+    run_dir = pathlib.Path(run_dir).resolve()
+    raw_path = run_dir / "raw_runs.csv"
+    if not raw_path.is_file() or not (run_dir / "config.yaml").is_file():
+        sys.exit(f"Not a Phase 3 run directory: {run_dir}")
+    df = pd.read_csv(raw_path)
+    if df.empty or df["run_id"].nunique() != 1:
+        sys.exit("Phase 3 raw_runs.csv must contain exactly one non-empty run_id")
+    from run_phase3 import _summary  # noqa: E402
+    agg = _summary(df)
+    agg.to_csv(run_dir / "summary.csv", index=False)
+    print(f"{len(df)} Phase 3 runs -> {run_dir / 'summary.csv'}")
+    return df, agg
+
+
 if __name__ == "__main__":
-    export()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--phase3-run-dir", help="rebuild summary for one isolated Phase 3 run")
+    args = parser.parse_args()
+    if args.phase3_run_dir:
+        export_phase3(args.phase3_run_dir)
+    else:
+        export()
